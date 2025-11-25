@@ -1,0 +1,122 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class KANLinear(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        num_frequencies=5,
+        scale_noise=0.1,
+        scale_base=1.0,
+        scale_spline=1.0,
+        enable_standalone_scale_spline=True,
+        base_activation=nn.SiLU,
+    ):
+        super(KANLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_frequencies = num_frequencies
+
+        self.base_weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.spline_weight = nn.Parameter(
+            torch.Tensor(out_features, in_features, num_frequencies * 2)
+        )
+        if enable_standalone_scale_spline:
+            self.spline_scaler = nn.Parameter(torch.Tensor(out_features, in_features))
+
+        self.scale_noise = scale_noise
+        self.scale_base = scale_base
+        self.scale_spline = scale_spline
+        self.enable_standalone_scale_spline = enable_standalone_scale_spline
+        self.base_activation = base_activation()
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5) * self.scale_base)
+        with torch.no_grad():
+            noise = (
+                torch.rand(self.out_features, self.in_features, self.num_frequencies * 2) - 0.5
+            ) * self.scale_noise
+
+            #print(f"spline_weight shape: {self.spline_weight.shape}")
+            #print(f"noise shape: {noise.shape}")
+
+            if self.spline_weight.shape != noise.shape:
+                raise ValueError(f"Dimensiones no coinciden: {self.spline_weight.shape} vs {noise.shape}")
+
+            self.spline_weight.data.copy_(
+                self.scale_spline * self.curve2coeff(noise)
+            )
+
+            if self.enable_standalone_scale_spline:
+                nn.init.kaiming_uniform_(self.spline_scaler, a=math.sqrt(5) * self.scale_spline)
+
+    def fourier_features(self, x):
+        assert x.dim() == 2 and x.size(1) == self.in_features
+
+        frequencies = torch.arange(1, self.num_frequencies + 1, device=x.device).float() * math.pi
+        sin_features = torch.sin(x.unsqueeze(-1) * frequencies)
+        cos_features = torch.cos(x.unsqueeze(-1) * frequencies)
+
+        features = torch.cat([sin_features, cos_features], dim=-1)
+        return features.contiguous()
+
+    def curve2coeff(self, y):
+        """
+        Calcula los coeficientes para las funciones base de sin/cos
+        """
+        # Cambiar las dimensiones de modo que coincidan
+        return y  # No es necesario permutar aquí
+
+    @property
+    def scaled_spline_weight(self):
+        return self.spline_weight * (
+            self.spline_scaler.unsqueeze(-1) if self.enable_standalone_scale_spline else 1.0
+        )
+
+    def forward(self, x):
+        assert x.dim() == 2 and x.size(1) == self.in_features
+
+        base_output = F.linear(self.base_activation(x), self.base_weight)
+        spline_output = F.linear(
+            self.fourier_features(x).view(x.size(0), -1),
+            self.scaled_spline_weight.view(self.out_features, -1),
+        )
+        return base_output + spline_output
+
+
+class KAN(nn.Module):
+    def __init__(
+        self,
+        layers_hidden,
+        num_frequencies=5,
+        scale_noise=0.1,
+        scale_base=1.0,
+        scale_spline=1.0,
+        base_activation=nn.SiLU,
+    ):
+        super(KAN, self).__init__()
+        self.num_frequencies = num_frequencies
+
+        self.layers = nn.ModuleList()
+        for in_features, out_features in zip(layers_hidden, layers_hidden[1:]):
+            self.layers.append(
+                KANLinear(
+                    in_features,
+                    out_features,
+                    num_frequencies=num_frequencies,
+                    scale_noise=scale_noise,
+                    scale_base=scale_base,
+                    scale_spline=scale_spline,
+                    base_activation=base_activation,
+                )
+            )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
