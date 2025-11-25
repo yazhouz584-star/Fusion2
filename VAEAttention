@@ -1,0 +1,93 @@
+import torch
+import torch.nn as nn
+
+class VAEAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, embed_len=64, low_rank=14, rank_multi=10, concate=False, \
+                qk_bias=False, attn_drop=0., proj_drop=0.):
+        super(VAEAttention, self).__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.qk = nn.Linear(dim, dim * 2, bias=qk_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.low_rank = low_rank
+        self.rank_multi = rank_multi
+        self.embed_len = embed_len
+        self.we = nn.Parameter(nn.init.orthogonal_(torch.Tensor(self.num_heads, min(self.embed_len, self.low_rank * self.rank_multi), self.low_rank)))
+        self.wr = nn.Parameter(nn.init.orthogonal_(torch.Tensor(self.num_heads, min(self.embed_len, self.low_rank * self.rank_multi), self.low_rank)))
+        self.log_lambda_sqrt_inv_diag = nn.Parameter(nn.init.uniform_(torch.Tensor(self.num_heads, self.low_rank)))
+
+        # VAE 相关参数
+        self.encoder_mean = nn.Linear(self.low_rank, self.low_rank)
+        self.encoder_logvar = nn.Linear(self.low_rank, self.low_rank)
+        self.decoder = nn.Linear(self.low_rank, self.low_rank)
+
+        self.final_weight = nn.Linear(self.low_rank, self.head_dim)
+
+        self.concate = concate
+        if self.concate:
+            self.embed_len_weight = nn.Linear(self.embed_len * 2, self.embed_len)
+
+    def gen_weights(self, x):
+        if self.embed_len > self.low_rank * self.rank_multi:
+            indices = torch.linspace(0, x.shape[1]-1, self.low_rank * self.rank_multi, dtype=int)
+            x = x.transpose(-2,-1).reshape(x.size(0), self.num_heads, self.head_dim, x.size(1))
+            x = x[:, :, :, indices].transpose(1, 2)
+        else:
+            x = x.transpose(-2,-1).reshape(x.size(0), self.num_heads, self.head_dim, x.size(1))
+            x = x.transpose(1, 2)
+        we = torch.einsum('bahd,hde->bahe', x, self.we.type_as(x)).transpose(1,2)
+        wr = torch.einsum('bahd,hde->bahe', x, self.wr.type_as(x)).transpose(1,2)
+        return we, wr
+
+    def feature_map(self, x):
+        return F.normalize(x, p=2, dim=-1)
+
+    def reparameterize(self, mean, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mean + eps * std
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qk = self.qk(x).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k = qk.unbind(0)
+
+        we, wr = self.gen_weights(x)
+        q = self.feature_map(q)
+        k = self.feature_map(k)
+        escore = torch.einsum('...nd,...de->...ne', q, we)
+        rscore = torch.einsum('...nd,...de->...ne', k, wr)
+        if self.concate:
+            score = torch.cat((escore, rscore), dim=2)
+
+        lambda_sqrt_inv_diag = torch.diag_embed(torch.exp(self.log_lambda_sqrt_inv_diag))
+        if self.concate:
+            v1 = score @ (lambda_sqrt_inv_diag.unsqueeze(0) ** 2)
+        else:
+            v1 = (escore + rscore) @ (lambda_sqrt_inv_diag.unsqueeze(0) ** 2)
+
+        # VAE 编码器
+        mean = self.encoder_mean(v1)
+        logvar = self.encoder_logvar(v1)
+
+        # 重参数化采样
+        samples = self.reparameterize(mean, logvar)
+
+        # VAE 解码器
+        samples = self.decoder(samples)
+
+        attn_out = self.final_weight(samples)
+        if self.concate:
+            attn_out = self.embed_len_weight(attn_out.permute(0,1,3,2)).permute(0,1,3,2)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, C)
+        attn_out = self.proj_drop(attn_out)
+
+        # VAE 的 KL 散度
+        kl = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
+
+        return attn_out, [escore, rscore, self.we, self.wr], lambda_sqrt_inv_diag, kl
